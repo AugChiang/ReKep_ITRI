@@ -5,15 +5,16 @@ from torch.nn.functional import interpolate
 from kmeans_pytorch import kmeans
 from utils import filter_points_by_bounds
 from sklearn.cluster import MeanShift
+from typing import Union, List, Tuple
 
 class KeypointProposer:
     def __init__(self, config):
         self.config = config
         self.device = torch.device(self.config['device'])
-        self.dinov2 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14').eval().to(self.device)
-        # local_model_path = '/omnigibson-src/ReKep/dinov2_vits14_pretrain.pth'
-        # checkpoint = torch.load(local_model_path)
-        # self.dinov2 = checkpoint
+        # self.dinov2 = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14').eval().to(self.device)
+        model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14', pretrained=False)
+        model.load_state_dict(torch.load('./checkpoints/dinov2_vits14_pretrain.pth', weights_only=True))
+        self.dinov2 = model.eval().to(self.device)
         self.bounds_min = np.array(self.config['bounds_min'])
         self.bounds_max = np.array(self.config['bounds_max'])
         self.mean_shift = MeanShift(bandwidth=self.config['min_dist_bt_keypoints'], bin_seeding=True, n_jobs=32)
@@ -49,18 +50,45 @@ class KeypointProposer:
         projected = self._project_keypoints_to_img(rgb, candidate_pixels, candidate_rigid_group_ids, masks, features_flat)
         return candidate_keypoints, projected
 
-    def _preprocess(self, rgb, points, masks):
-        if masks.is_cuda:
-            masks = masks.cpu()
-            # print("***masks", masks)
-            
-        rgb = rgb.cpu()  # move to CPU if on GPU
-        rgb = rgb.numpy() 
+    def _preprocess(
+            self, 
+            rgb:Union[torch.Tensor, np.ndarray], 
+            points:np.ndarray, 
+            masks:Union[torch.Tensor, np.ndarray]
+        ):
+        """
+        
+        Args:
+            - rgb (Union[torch.Tensor, np.ndarray]): image captured by the camera.
+            - points (np.ndarray): depth info with shape of (img_h, img_w, depth_value).
+            - masks (Union[torch.Tensor, np.ndarray]): the mask of the image segmentation with shape (img_h, img_w) and each pixel value is the segmentation id.
+
+        Returns:
+            - transformed_rgb(np.ndarray) with shape compatiable with `patch_h` * `patch_w` patches.
+            - rgb(np.ndarray) rgb image.
+            - points(np.ndarray) not processed, directly return.
+            - masks(List[np.ndarray]) with shape (number of unique seg, img_h, img_w).
+            - shape_info (dict)
+        """
+        if isinstance(masks, torch.Tensor):
+            if masks.is_cuda:
+                masks = masks.cpu()
+            masks = masks.numpy()
+        # print("***masks", masks)
+        
+        if isinstance(rgb, torch.Tensor):
+            if rgb.is_cuda:
+                rgb = rgb.cpu()
+            rgb = rgb.numpy() 
         # print("***rgb", rgb)
-            
+
+        # depth info size should be the same as rgb img's
+        assert points.shape[:-1] == rgb.shape[:-1]
+
         # convert masks to binary masks
-        masks = [masks == uid for uid in np.unique(masks.numpy())]
+        masks = [masks == uid for uid in np.unique(masks)]
         # print("***masks2", masks)
+
         # ensure input shape is compatible with dinov2
         H, W, _ = rgb.shape
         patch_h = int(H // self.patch_size)
@@ -69,6 +97,7 @@ class KeypointProposer:
         new_W = patch_w * self.patch_size
         # print("***rgb2", rgb)
         transformed_rgb = cv2.resize(rgb, (new_W, new_H))
+        #? dtype = float32 ?
         transformed_rgb = transformed_rgb.astype(np.float32) / 255.0  # float32 [H, W, 3]
         # shape info
         shape_info = {
@@ -99,7 +128,17 @@ class KeypointProposer:
 
     @torch.inference_mode()
     @torch.amp.autocast('cuda')
-    def _get_features(self, transformed_rgb, shape_info):
+    def _get_features(self, transformed_rgb:np.ndarray, shape_info:dict)->torch.Tensor:
+        """
+        Apply DINOv2 and interpolate, flatten the output feature maps.
+
+        Args:
+            transformed_rgb (np.ndarray): RGB image with shape compatiable with `patch_h` * `patch_w` patches.
+            shape_info (dict): dict of img shape and number of patches along H, W.
+
+        Returns:
+            torch.Tensor: interpolated, flattend feature maps with shape (img_h*img_w, n_features).
+        """
         img_h = shape_info['img_h']
         img_w = shape_info['img_w']
         patch_h = shape_info['patch_h']
@@ -118,14 +157,31 @@ class KeypointProposer:
         features_flat = interpolated_feature_grid.reshape(-1, interpolated_feature_grid.shape[-1])  # float32 [H*W, feature_dim]
         return features_flat
 
-    def _cluster_features(self, points, features_flat, masks):
+    def _cluster_features(
+            self, 
+            points:np.ndarray, 
+            features_flat:torch.Tensor, 
+            masks:List[Union[torch.Tensor, np.ndarray]]
+        )->Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Args:
+            points (np.ndarray): depth info with shape of (img_h, img_w, depth_value).
+            features_flat (torch.Tensor): interpolated, flattend feature maps with shape (img_h*img_w, n_features).
+            masks (List[np.ndarray]): segmentation results with length of number of unique seg and each item of (img_h, img_w).
+
+        Returns:
+            Tuple: numpy arrays of candidate points (N pts each is [x,y,z] of real scene), 
+                   pixels(N pts, each is [h,w] pos of image), and group ids (shape = [N,]).
+        """
         candidate_keypoints = []
         candidate_pixels = []
         candidate_rigid_group_ids = []
         for rigid_group_id, binary_mask in enumerate(masks):
             # ignore mask that is too large
             # print("***binary_mask", binary_mask)
-            binary_mask = binary_mask.cpu().numpy()
+            if isinstance(binary_mask, torch.Tensor):
+                if binary_mask.is_cuda:
+                    binary_mask = binary_mask.cpu().numpy()
             if np.mean(binary_mask) > self.config['max_mask_ratio']:
                 continue
             # consider only foreground features
@@ -143,13 +199,20 @@ class KeypointProposer:
             feature_points_torch  = (feature_points_torch - feature_points_torch.min(0)[0]) / (feature_points_torch.max(0)[0] - feature_points_torch.min(0)[0])
             X = torch.cat([X, feature_points_torch], dim=-1)
             # cluster features to get meaningful regions
-            cluster_ids_x, cluster_centers = kmeans(
-                X=X,
-                num_clusters=self.config['num_candidates_per_mask'],
-                distance='euclidean',
-                device=self.device,
-            )
-            cluster_centers = cluster_centers.to(self.device)
+            # skip masks  # too small
+            if X.shape[0] < self.config['num_candidates_per_mask']:
+                continue
+            try:
+                cluster_ids_x, cluster_centers = kmeans(
+                    X=X,
+                    num_clusters=self.config['num_candidates_per_mask'],
+                    distance='euclidean',
+                    device=self.device,
+                )
+                cluster_centers = cluster_centers.to(self.device)
+            except ValueError as e:
+                print("The number of features may less than the number of k of k-means.")
+                raise e
             for cluster_id in range(self.config['num_candidates_per_mask']):
                 cluster_center = cluster_centers[cluster_id][:3]
                 member_idx = cluster_ids_x == cluster_id
@@ -169,6 +232,7 @@ class KeypointProposer:
         return candidate_keypoints, candidate_pixels, candidate_rigid_group_ids
 
     def _merge_clusters(self, candidate_keypoints):
+        
         self.mean_shift.fit(candidate_keypoints)
         cluster_centers = self.mean_shift.cluster_centers_
         merged_indices = []
